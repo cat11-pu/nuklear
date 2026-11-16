@@ -4728,9 +4728,14 @@ struct nk_draw_command {
 #endif
 };
 
+#ifndef NK_DRAW_LIST_PATH_CAPACITY
+#define NK_DRAW_LIST_PATH_CAPACITY 64
+#endif
+
 struct nk_draw_list {
     struct nk_rect clip_rect;
     struct nk_vec2 circle_vtx[12];
+    struct nk_vec2 path[NK_DRAW_LIST_PATH_CAPACITY];
     struct nk_convert_config config;
 
     struct nk_buffer *buffer;
@@ -4744,6 +4749,8 @@ struct nk_draw_list {
 
     unsigned int path_count;
     unsigned int path_offset;
+    unsigned int path_buffer;
+    unsigned int vertex_layout;
 
     enum nk_anti_aliasing line_AA;
     enum nk_anti_aliasing shape_AA;
@@ -6087,8 +6094,8 @@ nk_sin(float x)
 NK_LIB float
 nk_cos(float x)
 {
-    /* New implementation. Also generated using lolremez. */
-    /* Old version significantly deviated from expected results. */
+    // New implementation. Also generated using lolremez.
+    // Old version significantly deviated from expected results.
     NK_STORAGE const float a0 = 9.9995999154986614e-1f;
     NK_STORAGE const float a1 = 1.2548995793001028e-3f;
     NK_STORAGE const float a2 = -5.0648546280678015e-1f;
@@ -8801,6 +8808,9 @@ nk_push_scissor(struct nk_command_buffer *b, struct nk_rect r)
     struct nk_command_scissor *cmd;
     NK_ASSERT(b);
     if (!b) return;
+    if (b->clip.x == r.x && b->clip.y == r.y &&
+        b->clip.w == r.w && b->clip.h == r.h)
+        return;
 
     b->clip.x = r.x;
     b->clip.y = r.y;
@@ -9212,6 +9222,18 @@ nk_draw_text(struct nk_command_buffer *b, struct nk_rect r,
 
 
 
+#ifndef NK_DRAW_LIST_TEMP_POINTS
+#define NK_DRAW_LIST_TEMP_POINTS 64
+#endif
+
+enum nk_draw_list_vertex_layout {
+    NK_DRAW_LIST_VERTEX_GENERIC,
+    NK_DRAW_LIST_VERTEX_FLOAT,
+    NK_DRAW_LIST_VERTEX_RGBA8
+};
+
+NK_INTERN int nk_draw_vertex_layout_element_is_end_of_layout(
+    const struct nk_draw_vertex_layout_element *element);
 
 /* ===============================================================
  *
@@ -9259,6 +9281,32 @@ nk_draw_list_setup(struct nk_draw_list *canvas, const struct nk_convert_config *
     canvas->cmd_offset = 0;
     canvas->cmd_count = 0;
     canvas->path_count = 0;
+    canvas->path_offset = 0;
+    canvas->path_buffer = 0;
+    {
+        const struct nk_draw_vertex_layout_element *layout = config->vertex_layout;
+        unsigned int count = 0;
+        while (count < 4 && !nk_draw_vertex_layout_element_is_end_of_layout(layout)) {
+            count++;
+            layout++;
+        }
+        canvas->vertex_layout = NK_DRAW_LIST_VERTEX_GENERIC;
+        if (count == 3 && nk_draw_vertex_layout_element_is_end_of_layout(layout) &&
+            config->vertex_size % NK_ALIGNOF(float) == 0 &&
+            config->vertex_layout[0].offset % NK_ALIGNOF(float) == 0 &&
+            config->vertex_layout[1].offset % NK_ALIGNOF(float) == 0 &&
+            config->vertex_layout[2].offset % NK_ALIGNOF(float) == 0 &&
+            config->vertex_layout[0].attribute == NK_VERTEX_POSITION &&
+            config->vertex_layout[0].format == NK_FORMAT_FLOAT &&
+            config->vertex_layout[1].attribute == NK_VERTEX_TEXCOORD &&
+            config->vertex_layout[1].format == NK_FORMAT_FLOAT &&
+            config->vertex_layout[2].attribute == NK_VERTEX_COLOR) {
+            if (config->vertex_layout[2].format == NK_FORMAT_R32G32B32A32_FLOAT)
+                canvas->vertex_layout = NK_DRAW_LIST_VERTEX_FLOAT;
+            else if (config->vertex_layout[2].format == NK_FORMAT_R8G8B8A8)
+                canvas->vertex_layout = NK_DRAW_LIST_VERTEX_RGBA8;
+        }
+    }
 }
 NK_API const struct nk_draw_command*
 nk__draw_list_begin(const struct nk_draw_list *canvas, const struct nk_buffer *buffer)
@@ -9321,9 +9369,10 @@ nk_draw_list_alloc_path(struct nk_draw_list *list, int count)
                         point_size * (nk_size)count, point_align);
 
     if (!points) return 0;
-    if (!list->path_offset) {
+    if (!list->path_buffer) {
         void *memory = nk_buffer_memory(list->buffer);
         list->path_offset = (unsigned int)((nk_byte*)points - (nk_byte*)memory);
+        list->path_buffer = nk_true;
     }
     list->path_count += (unsigned int)count;
     return points;
@@ -9334,6 +9383,8 @@ nk_draw_list_path_last(struct nk_draw_list *list)
     void *memory;
     struct nk_vec2 *point;
     NK_ASSERT(list->path_count);
+    if (!list->path_buffer)
+        return list->path[list->path_count-1];
     memory = nk_buffer_memory(list->buffer);
     point = nk_ptr_add(struct nk_vec2, memory, list->path_offset);
     point += (list->path_count-1);
@@ -9394,6 +9445,11 @@ nk_draw_list_add_clip(struct nk_draw_list *list, struct nk_rect rect)
         struct nk_draw_command *prev = nk_draw_list_command_last(list);
         if (prev->elem_count == 0)
             prev->clip_rect = rect;
+        else if (prev->clip_rect.x == rect.x && prev->clip_rect.y == rect.y &&
+            prev->clip_rect.w == rect.w && prev->clip_rect.h == rect.h) {
+            list->clip_rect = rect;
+            return;
+        }
         nk_draw_list_push_command(list, rect, prev->texture);
     }
 }
@@ -9604,11 +9660,35 @@ nk_draw_vertex_element(void *dst, const float *values, int value_count,
     }
 }
 NK_INTERN void*
-nk_draw_vertex(void *dst, const struct nk_convert_config *config,
+nk_draw_vertex(struct nk_draw_list *list, void *dst,
     struct nk_vec2 pos, struct nk_vec2 uv, struct nk_colorf color)
 {
+    const struct nk_convert_config *config = &list->config;
     void *result = (void*)((char*)dst + config->vertex_size);
     const struct nk_draw_vertex_layout_element *elem_iter = config->vertex_layout;
+
+    if (list->vertex_layout != NK_DRAW_LIST_VERTEX_GENERIC) {
+        float *position = (float*)((char*)dst + elem_iter[0].offset);
+        float *texcoord = (float*)((char*)dst + elem_iter[1].offset);
+        position[0] = pos.x;
+        position[1] = pos.y;
+        texcoord[0] = uv.x;
+        texcoord[1] = uv.y;
+        if (list->vertex_layout == NK_DRAW_LIST_VERTEX_FLOAT) {
+            float *vertex_color = (float*)((char*)dst + elem_iter[2].offset);
+            vertex_color[0] = NK_SATURATE(color.r);
+            vertex_color[1] = NK_SATURATE(color.g);
+            vertex_color[2] = NK_SATURATE(color.b);
+            vertex_color[3] = NK_SATURATE(color.a);
+        } else {
+            nk_byte *vertex_color = (nk_byte*)((char*)dst + elem_iter[2].offset);
+            vertex_color[0] = (nk_byte)(NK_SATURATE(color.r) * 255.0f);
+            vertex_color[1] = (nk_byte)(NK_SATURATE(color.g) * 255.0f);
+            vertex_color[2] = (nk_byte)(NK_SATURATE(color.b) * 255.0f);
+            vertex_color[3] = (nk_byte)(NK_SATURATE(color.a) * 255.0f);
+        }
+        return result;
+    }
     while (!nk_draw_vertex_layout_element_is_end_of_layout(elem_iter)) {
         void *address = (void*)((char*)dst + elem_iter->offset);
         switch (elem_iter->attribute) {
@@ -9656,7 +9736,7 @@ nk_draw_list_stroke_poly_line(struct nk_draw_list *list, const struct nk_vec2 *p
 
         /* allocate vertices and elements  */
         nk_size i1 = 0;
-        nk_size vertex_offset;
+        nk_size vertex_offset = 0;
         nk_size index = list->vertex_count;
 
         const nk_size idx_count = (thick_line) ?  (count * 18) : (count * 12);
@@ -9665,20 +9745,27 @@ nk_draw_list_stroke_poly_line(struct nk_draw_list *list, const struct nk_vec2 *p
         void *vtx = nk_draw_list_alloc_vertices(list, vtx_count);
         nk_draw_index *ids = nk_draw_list_alloc_elements(list, idx_count);
 
-        nk_size size;
-        struct nk_vec2 *normals, *temp;
+        nk_size size = 0;
+        struct nk_vec2 stack_normals[NK_DRAW_LIST_TEMP_POINTS];
+        struct nk_vec2 stack_temp[NK_DRAW_LIST_TEMP_POINTS * 4];
+        struct nk_vec2 *normals = stack_normals;
+        struct nk_vec2 *temp = stack_temp;
+        int use_temp_buffer = 0;
         if (!vtx || !ids) return;
 
-        /* temporary allocate normals + points */
-        vertex_offset = (nk_size)((nk_byte*)vtx - (nk_byte*)list->vertices->memory.ptr);
-        nk_buffer_mark(list->vertices, NK_BUFFER_FRONT);
-        size = pnt_size * ((thick_line) ? 5 : 3) * points_count;
-        normals = (struct nk_vec2*) nk_buffer_alloc(list->vertices, NK_BUFFER_FRONT, size, pnt_align);
-        if (!normals) return;
-        temp = normals + points_count;
+        if (points_count > NK_DRAW_LIST_TEMP_POINTS) {
+            /* temporary allocate normals + points */
+            vertex_offset = (nk_size)((nk_byte*)vtx - (nk_byte*)list->vertices->memory.ptr);
+            nk_buffer_mark(list->vertices, NK_BUFFER_FRONT);
+            size = pnt_size * ((thick_line) ? 5 : 3) * points_count;
+            normals = (struct nk_vec2*) nk_buffer_alloc(list->vertices, NK_BUFFER_FRONT, size, pnt_align);
+            if (!normals) return;
+            temp = normals + points_count;
+            use_temp_buffer = 1;
 
-        /* make sure vertex pointer is still correct */
-        vtx = (void*)((nk_byte*)list->vertices->memory.ptr + vertex_offset);
+            /* make sure vertex pointer is still correct */
+            vtx = (void*)((nk_byte*)list->vertices->memory.ptr + vertex_offset);
+        }
 
         /* calculate normals */
         for (i1 = 0; i1 < count; ++i1) {
@@ -9745,9 +9832,9 @@ nk_draw_list_stroke_poly_line(struct nk_draw_list *list, const struct nk_vec2 *p
             /* fill vertices */
             for (i = 0; i < points_count; ++i) {
                 const struct nk_vec2 uv = list->config.null.uv;
-                vtx = nk_draw_vertex(vtx, &list->config, points[i], uv, col);
-                vtx = nk_draw_vertex(vtx, &list->config, temp[i*2+0], uv, col_trans);
-                vtx = nk_draw_vertex(vtx, &list->config, temp[i*2+1], uv, col_trans);
+                vtx = nk_draw_vertex(list, vtx, points[i], uv, col);
+                vtx = nk_draw_vertex(list, vtx, temp[i*2+0], uv, col_trans);
+                vtx = nk_draw_vertex(list, vtx, temp[i*2+1], uv, col_trans);
             }
         } else {
             nk_size idx1, i;
@@ -9810,14 +9897,15 @@ nk_draw_list_stroke_poly_line(struct nk_draw_list *list, const struct nk_vec2 *p
             /* add vertices */
             for (i = 0; i < points_count; ++i) {
                 const struct nk_vec2 uv = list->config.null.uv;
-                vtx = nk_draw_vertex(vtx, &list->config, temp[i*4+0], uv, col_trans);
-                vtx = nk_draw_vertex(vtx, &list->config, temp[i*4+1], uv, col);
-                vtx = nk_draw_vertex(vtx, &list->config, temp[i*4+2], uv, col);
-                vtx = nk_draw_vertex(vtx, &list->config, temp[i*4+3], uv, col_trans);
+                vtx = nk_draw_vertex(list, vtx, temp[i*4+0], uv, col_trans);
+                vtx = nk_draw_vertex(list, vtx, temp[i*4+1], uv, col);
+                vtx = nk_draw_vertex(list, vtx, temp[i*4+2], uv, col);
+                vtx = nk_draw_vertex(list, vtx, temp[i*4+3], uv, col_trans);
             }
         }
         /* free temporary normals + points */
-        nk_buffer_reset(list->vertices, NK_BUFFER_FRONT);
+        if (use_temp_buffer)
+            nk_buffer_reset(list->vertices, NK_BUFFER_FRONT);
     } else {
         /* NON ANTI-ALIASED STROKE */
         nk_size i1 = 0;
@@ -9848,10 +9936,10 @@ nk_draw_list_stroke_poly_line(struct nk_draw_list *list, const struct nk_vec2 *p
             dx = diff.x * (thickness * 0.5f);
             dy = diff.y * (thickness * 0.5f);
 
-            vtx = nk_draw_vertex(vtx, &list->config, nk_vec2(p1.x + dy, p1.y - dx), uv, col);
-            vtx = nk_draw_vertex(vtx, &list->config, nk_vec2(p2.x + dy, p2.y - dx), uv, col);
-            vtx = nk_draw_vertex(vtx, &list->config, nk_vec2(p2.x - dy, p2.y + dx), uv, col);
-            vtx = nk_draw_vertex(vtx, &list->config, nk_vec2(p1.x - dy, p1.y + dx), uv, col);
+            vtx = nk_draw_vertex(list, vtx, nk_vec2(p1.x + dy, p1.y - dx), uv, col);
+            vtx = nk_draw_vertex(list, vtx, nk_vec2(p2.x + dy, p2.y - dx), uv, col);
+            vtx = nk_draw_vertex(list, vtx, nk_vec2(p2.x - dy, p2.y + dx), uv, col);
+            vtx = nk_draw_vertex(list, vtx, nk_vec2(p1.x - dy, p1.y + dx), uv, col);
 
             ids[0] = (nk_draw_index)(idx+0); ids[1] = (nk_draw_index)(idx+1);
             ids[2] = (nk_draw_index)(idx+2); ids[3] = (nk_draw_index)(idx+0);
@@ -9900,18 +9988,23 @@ nk_draw_list_fill_poly_convex(struct nk_draw_list *list,
         nk_draw_index *ids = nk_draw_list_alloc_elements(list, idx_count);
 
         nk_size size = 0;
-        struct nk_vec2 *normals = 0;
+        struct nk_vec2 stack_normals[NK_DRAW_LIST_TEMP_POINTS];
+        struct nk_vec2 *normals = stack_normals;
+        int use_temp_buffer = 0;
         unsigned int vtx_inner_idx = (unsigned int)(index + 0);
         unsigned int vtx_outer_idx = (unsigned int)(index + 1);
         if (!vtx || !ids) return;
 
-        /* temporary allocate normals */
-        vertex_offset = (nk_size)((nk_byte*)vtx - (nk_byte*)list->vertices->memory.ptr);
-        nk_buffer_mark(list->vertices, NK_BUFFER_FRONT);
-        size = pnt_size * points_count;
-        normals = (struct nk_vec2*) nk_buffer_alloc(list->vertices, NK_BUFFER_FRONT, size, pnt_align);
-        if (!normals) return;
-        vtx = (void*)((nk_byte*)list->vertices->memory.ptr + vertex_offset);
+        if (points_count > NK_DRAW_LIST_TEMP_POINTS) {
+            /* temporary allocate normals */
+            vertex_offset = (nk_size)((nk_byte*)vtx - (nk_byte*)list->vertices->memory.ptr);
+            nk_buffer_mark(list->vertices, NK_BUFFER_FRONT);
+            size = pnt_size * points_count;
+            normals = (struct nk_vec2*) nk_buffer_alloc(list->vertices, NK_BUFFER_FRONT, size, pnt_align);
+            if (!normals) return;
+            vtx = (void*)((nk_byte*)list->vertices->memory.ptr + vertex_offset);
+            use_temp_buffer = 1;
+        }
 
         /* add elements */
         for (i = 2; i < points_count; i++) {
@@ -9953,8 +10046,8 @@ nk_draw_list_fill_poly_convex(struct nk_draw_list *list,
             dm = nk_vec2_muls(dm, AA_SIZE * 0.5f);
 
             /* add vertices */
-            vtx = nk_draw_vertex(vtx, &list->config, nk_vec2_sub(points[i1], dm), uv, col);
-            vtx = nk_draw_vertex(vtx, &list->config, nk_vec2_add(points[i1], dm), uv, col_trans);
+            vtx = nk_draw_vertex(list, vtx, nk_vec2_sub(points[i1], dm), uv, col);
+            vtx = nk_draw_vertex(list, vtx, nk_vec2_add(points[i1], dm), uv, col_trans);
 
             /* add indexes */
             ids[0] = (nk_draw_index)(vtx_inner_idx+(i1<<1));
@@ -9966,7 +10059,8 @@ nk_draw_list_fill_poly_convex(struct nk_draw_list *list,
             ids += 6;
         }
         /* free temporary normals + points */
-        nk_buffer_reset(list->vertices, NK_BUFFER_FRONT);
+        if (use_temp_buffer)
+            nk_buffer_reset(list->vertices, NK_BUFFER_FRONT);
     } else {
         nk_size i = 0;
         nk_size index = list->vertex_count;
@@ -9977,7 +10071,7 @@ nk_draw_list_fill_poly_convex(struct nk_draw_list *list,
 
         if (!vtx || !ids) return;
         for (i = 0; i < vtx_count; ++i)
-            vtx = nk_draw_vertex(vtx, &list->config, points[i], list->config.null.uv, col);
+            vtx = nk_draw_vertex(list, vtx, points[i], list->config.null.uv, col);
         for (i = 2; i < points_count; ++i) {
             ids[0] = (nk_draw_index)index;
             ids[1] = (nk_draw_index)(index+ i - 1);
@@ -9991,9 +10085,11 @@ nk_draw_list_path_clear(struct nk_draw_list *list)
 {
     NK_ASSERT(list);
     if (!list) return;
-    nk_buffer_reset(list->buffer, NK_BUFFER_FRONT);
+    if (list->path_buffer)
+        nk_buffer_reset(list->buffer, NK_BUFFER_FRONT);
     list->path_count = 0;
     list->path_offset = 0;
+    list->path_buffer = 0;
 }
 NK_API void
 nk_draw_list_path_line_to(struct nk_draw_list *list, struct nk_vec2 pos)
@@ -10009,6 +10105,26 @@ nk_draw_list_path_line_to(struct nk_draw_list *list, struct nk_vec2 pos)
     if (cmd && cmd->texture.ptr != list->config.null.texture.ptr)
         nk_draw_list_push_image(list, list->config.null.texture);
 
+    if (!list->path_buffer &&
+        list->path_count < (unsigned int)NK_DRAW_LIST_PATH_CAPACITY) {
+        list->path[list->path_count++] = pos;
+        return;
+    }
+    if (!list->path_buffer) {
+        const unsigned int count = list->path_count;
+        NK_STORAGE const nk_size point_align = NK_ALIGNOF(struct nk_vec2);
+        NK_STORAGE const nk_size point_size = sizeof(struct nk_vec2);
+        points = (struct nk_vec2*)nk_buffer_alloc(list->buffer,
+            NK_BUFFER_FRONT, point_size * ((nk_size)count + 1), point_align);
+        if (!points) return;
+        list->path_offset = (unsigned int)((nk_byte*)points -
+            (nk_byte*)nk_buffer_memory(list->buffer));
+        list->path_buffer = nk_true;
+        NK_MEMCPY(points, list->path, sizeof(struct nk_vec2) * count);
+        points[count] = pos;
+        list->path_count = count + 1;
+        return;
+    }
     points = nk_draw_list_alloc_path(list, 1);
     if (!points) return;
     points[0] = pos;
@@ -10130,7 +10246,10 @@ nk_draw_list_path_fill(struct nk_draw_list *list, struct nk_color color)
     struct nk_vec2 *points;
     NK_ASSERT(list);
     if (!list) return;
-    points = (struct nk_vec2*)nk_buffer_memory(list->buffer);
+    if (list->path_buffer)
+        points = nk_ptr_add(struct nk_vec2, nk_buffer_memory(list->buffer),
+            list->path_offset);
+    else points = list->path;
     nk_draw_list_fill_poly_convex(list, points, list->path_count, color, list->config.shape_AA);
     nk_draw_list_path_clear(list);
 }
@@ -10141,7 +10260,10 @@ nk_draw_list_path_stroke(struct nk_draw_list *list, struct nk_color color,
     struct nk_vec2 *points;
     NK_ASSERT(list);
     if (!list) return;
-    points = (struct nk_vec2*)nk_buffer_memory(list->buffer);
+    if (list->path_buffer)
+        points = nk_ptr_add(struct nk_vec2, nk_buffer_memory(list->buffer),
+            list->path_offset);
+    else points = list->path;
     nk_draw_list_stroke_poly_line(list, points, list->path_count, color,
         closed, thickness, list->config.line_AA);
     nk_draw_list_path_clear(list);
@@ -10219,10 +10341,10 @@ nk_draw_list_fill_rect_multi_color(struct nk_draw_list *list, struct nk_rect rec
     idx[2] = (nk_draw_index)(index+2); idx[3] = (nk_draw_index)(index+0);
     idx[4] = (nk_draw_index)(index+2); idx[5] = (nk_draw_index)(index+3);
 
-    vtx = nk_draw_vertex(vtx, &list->config, nk_vec2(rect.x, rect.y), list->config.null.uv, col_left);
-    vtx = nk_draw_vertex(vtx, &list->config, nk_vec2(rect.x + rect.w, rect.y), list->config.null.uv, col_top);
-    vtx = nk_draw_vertex(vtx, &list->config, nk_vec2(rect.x + rect.w, rect.y + rect.h), list->config.null.uv, col_right);
-    vtx = nk_draw_vertex(vtx, &list->config, nk_vec2(rect.x, rect.y + rect.h), list->config.null.uv, col_bottom);
+    vtx = nk_draw_vertex(list, vtx, nk_vec2(rect.x, rect.y), list->config.null.uv, col_left);
+    vtx = nk_draw_vertex(list, vtx, nk_vec2(rect.x + rect.w, rect.y), list->config.null.uv, col_top);
+    vtx = nk_draw_vertex(list, vtx, nk_vec2(rect.x + rect.w, rect.y + rect.h), list->config.null.uv, col_right);
+    vtx = nk_draw_vertex(list, vtx, nk_vec2(rect.x, rect.y + rect.h), list->config.null.uv, col_bottom);
 }
 NK_API void
 nk_draw_list_fill_triangle(struct nk_draw_list *list, struct nk_vec2 a,
@@ -10311,10 +10433,10 @@ nk_draw_list_push_rect_uv(struct nk_draw_list *list, struct nk_vec2 a,
     idx[2] = (nk_draw_index)(index+2); idx[3] = (nk_draw_index)(index+0);
     idx[4] = (nk_draw_index)(index+2); idx[5] = (nk_draw_index)(index+3);
 
-    vtx = nk_draw_vertex(vtx, &list->config, a, uva, col);
-    vtx = nk_draw_vertex(vtx, &list->config, b, uvb, col);
-    vtx = nk_draw_vertex(vtx, &list->config, c, uvc, col);
-    vtx = nk_draw_vertex(vtx, &list->config, d, uvd, col);
+    vtx = nk_draw_vertex(list, vtx, a, uva, col);
+    vtx = nk_draw_vertex(list, vtx, b, uvb, col);
+    vtx = nk_draw_vertex(list, vtx, c, uvc, col);
+    vtx = nk_draw_vertex(list, vtx, d, uvd, col);
 }
 NK_API void
 nk_draw_list_add_image(struct nk_draw_list *list, struct nk_image texture,
@@ -10547,7 +10669,6 @@ nk__draw_next(const struct nk_draw_command *cmd,
     return nk__draw_list_next(cmd, buffer, &ctx->draw_list);
 }
 #endif
-
 
 
 

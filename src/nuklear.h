@@ -4509,9 +4509,14 @@ struct nk_draw_command {
 #endif
 };
 
+#ifndef NK_DRAW_LIST_PATH_CAPACITY
+#define NK_DRAW_LIST_PATH_CAPACITY 64
+#endif
+
 struct nk_draw_list {
     struct nk_rect clip_rect;
     struct nk_vec2 circle_vtx[12];
+    struct nk_vec2 path[NK_DRAW_LIST_PATH_CAPACITY];
     struct nk_convert_config config;
 
     struct nk_buffer *buffer;
@@ -4525,6 +4530,8 @@ struct nk_draw_list {
 
     unsigned int path_count;
     unsigned int path_offset;
+    unsigned int path_buffer;
+    unsigned int vertex_layout;
 
     enum nk_anti_aliasing line_AA;
     enum nk_anti_aliasing shape_AA;

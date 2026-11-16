@@ -71,6 +71,9 @@ nk_push_scissor(struct nk_command_buffer *b, struct nk_rect r)
     struct nk_command_scissor *cmd;
     NK_ASSERT(b);
     if (!b) return;
+    if (b->clip.x == r.x && b->clip.y == r.y &&
+        b->clip.w == r.w && b->clip.h == r.h)
+        return;
 
     b->clip.x = r.x;
     b->clip.y = r.y;
@@ -478,4 +481,3 @@ nk_draw_text(struct nk_command_buffer *b, struct nk_rect r,
     NK_MEMCPY(cmd->string, string, (nk_size)length);
     cmd->string[length] = '\0';
 }
-
