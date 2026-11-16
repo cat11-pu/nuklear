@@ -2819,6 +2819,8 @@ NK_API void nk_list_view_end(struct nk_list_view*);
  *                                  WIDGET
  *
  * ============================================================================= */
+typedef void (*nk_custom_widget_draw)(struct nk_command_buffer *canvas,
+    struct nk_rect bounds, struct nk_rect clip, nk_handle userdata);
 enum nk_widget_layout_states {
     NK_WIDGET_INVALID, /* The widget cannot be seen and is completely out of view */
     NK_WIDGET_VALID, /* The widget is completely inside the window and can be updated and drawn */
@@ -2836,6 +2838,38 @@ enum nk_widget_states {
 };
 NK_API enum nk_widget_layout_states nk_widget(struct nk_rect*, const struct nk_context*);
 NK_API enum nk_widget_layout_states nk_widget_fitting(struct nk_rect*, struct nk_context*, struct nk_vec2);
+/*/// #### nk_custom_widget
+/// Allocates one widget slot using the same layout and visibility rules as
+/// `nk_widget` and invokes a draw callback inside a temporary scissor region.
+///
+/// `clip` is in screen coordinates. It is intersected with the allocated widget
+/// bounds, the current panel clip and any enclosing scissor before drawing.
+/// The callback receives the allocated bounds and the effective clip. The
+/// command-buffer clipping state is restored before returning, including when
+/// the callback pushes additional scissors. The callback is skipped when the
+/// widget or effective clip is empty. The returned layout state is the same as
+/// `nk_widget` would return for this slot.
+///
+/// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~c
+/// void draw_custom(struct nk_command_buffer *canvas, struct nk_rect bounds,
+///     struct nk_rect clip, nk_handle userdata);
+///
+/// struct nk_rect clip = nk_widget_bounds(ctx);
+/// enum nk_widget_layout_states state =
+///     nk_custom_widget(ctx, clip, draw_custom, nk_handle_ptr(data));
+/// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+///
+/// Parameter   | Description
+/// ------------|-----------------------------------------------------------
+/// __ctx__     | Must point to a previously initialized `nk_context` struct
+/// __clip__    | Screen-space clipping rectangle requested by the caller
+/// __draw__    | Callback invoked for visible widgets; may be NULL
+/// __userdata__| User data passed through to the callback
+///
+/// Returns `NK_WIDGET_INVALID` when the slot is outside the current clip,
+/// otherwise `NK_WIDGET_VALID` or `NK_WIDGET_ROM` with `nk_widget` semantics.
+*/
+NK_API enum nk_widget_layout_states nk_custom_widget(struct nk_context*, struct nk_rect, nk_custom_widget_draw, nk_handle);
 NK_API struct nk_rect nk_widget_bounds(struct nk_context*);
 NK_API struct nk_vec2 nk_widget_position(struct nk_context*);
 NK_API struct nk_vec2 nk_widget_size(struct nk_context*);
